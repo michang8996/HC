@@ -2,13 +2,31 @@ name: XQ 下引線選股
 
 on:
   schedule:
-    # 每天台灣 19:00（UTC 11:00）。週末 / 國定假日程式會自己判斷今日無行情、不推播。
+    # 每天台灣 19:00（UTC 11:00）。今天沒有完整行情（週末 / 假日 / 交易所未公布）時，
+    # 程式自動改用最近交易日，Discord 標題會寫明實際資料日期。
     # GitHub 排程尖峰時段常延遲 10～30 分鐘，實際推播時間會落在 19:00～19:30。
     - cron: "0 11 * * *"
   workflow_dispatch:
     inputs:
+      days_back:
+        description: "要看哪一天的選股（下拉選，假日自動跳過）"
+        type: choice
+        required: true
+        default: "0｜最新交易日"
+        options:
+          - "0｜最新交易日"
+          - "1｜前 1 個交易日"
+          - "2｜前 2 個交易日"
+          - "3｜前 3 個交易日"
+          - "4｜前 4 個交易日"
+          - "5｜前 5 個交易日"
+          - "6｜前 6 個交易日"
+          - "7｜前 7 個交易日"
+          - "8｜前 8 個交易日"
+          - "9｜前 9 個交易日"
+          - "10｜前 10 個交易日"
       target_date:
-        description: "指定結算日 YYYYMMDD（留空 = 今天）"
+        description: "進階：指定日期 YYYYMMDD（一般留空，用上面的選單就好）"
         required: false
         default: ""
 
@@ -30,6 +48,7 @@ jobs:
       - name: 執行選股
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DAYS_BACK: ${{ github.event.inputs.days_back }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: python lower_shadow_screener.py
 

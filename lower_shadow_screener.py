@@ -64,9 +64,16 @@ REQUEST_RETRY_SLEEP = max(1.0, float(os.getenv("REQUEST_RETRY_SLEEP", "6")))
 # 指定結算日（YYYYMMDD）。留空 = 今天（台北時間）。補跑歷史日期時用。
 TARGET_DATE = os.getenv("TARGET_DATE", "").strip()
 
-# 排程跑的時候今天若沒有行情（假日／颱風假／資料未出）就不推播。
-# TARGET_DATE 有指定時自動不檢查。
-REQUIRE_TODAY = os.getenv("REQUIRE_TODAY", "1").strip().lower() not in ("0", "false", "no", "off")
+# 從「最新完整交易日」再往前 N 個交易日結算。給 GitHub 手動執行的下拉選單用，
+# 不用自己算日期、也不用管中間有沒有假日。0 = 最新交易日。
+# 選單值長得像「1｜前 1 個交易日」，只取開頭數字。
+_days_back_raw = re.match(r"\s*(\d+)", os.getenv("DAYS_BACK", "0") or "0")
+DAYS_BACK = int(_days_back_raw.group(1)) if _days_back_raw else 0
+
+# 預設：今天（或指定日）沒有完整行情時，自動改用最近一個上市櫃都有資料的交易日，
+# Discord 標題會寫明實際資料日期。設 SKIP_IF_NOT_TODAY=1 則改成「不是今天就不推播」，
+# 避免週末 / 假日重複推上一個交易日的結果。
+SKIP_IF_NOT_TODAY = os.getenv("SKIP_IF_NOT_TODAY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # 預設只篩一般股票（4 碼、非 0 開頭）。ETF（0050、00878…）的下引線意義不同，預設排除。
 INCLUDE_ETF = os.getenv("INCLUDE_ETF", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -392,22 +399,25 @@ def fetch_recent_trading_days(end_date: datetime):
     """從 end_date 往回抓，直到湊滿 NEED_TRADING_DAYS 個交易日。
 
     以 TWSE 判斷是否為交易日（TWSE 有資料 = 交易日），TPEx 跟著抓同一天。
-    回傳 (DataFrame, 交易日清單由舊到新)；REQUIRE_TODAY 且 end_date 沒資料時回 (None, [])。
+    最新一天若上市或上櫃還沒公布，就自動往前找「上市櫃都有資料」的最近交易日當結算日——
+    2026-10-13 14:35 實測：TWSE 當日 1,087 檔已出，TPEx 同一天還是 0 筆，
+    兩個交易所公布時間不同步，不能只看 TWSE。
+    結算日確定之後，更早的日子缺資料就是真的抓取失敗，照 MAX_ALLOWED_FAILED_DATES 中止。
+    回傳 (DataFrame, 交易日清單由舊到新)；SKIP_IF_NOT_TODAY 且最新資料不是 end_date 時回 (None, [])。
     """
     frames = []
     trading_days = []
     failed = []
     d = end_date
+    days_back_left = DAYS_BACK
 
-    for scanned in range(MAX_CALENDAR_SCAN_DAYS):
+    for _ in range(MAX_CALENDAR_SCAN_DAYS + DAYS_BACK * 2):
         if len(trading_days) >= NEED_TRADING_DAYS:
             break
-        is_end_day = scanned == 0
+        # 還沒找到結算日之前，缺資料一律當「尚未公布 / 休市」往前找，不算失敗。
+        finding_latest = not trading_days
 
         if d.weekday() >= 5:
-            if is_end_day and REQUIRE_TODAY and not TARGET_DATE:
-                log(f"⚠️ {d:%Y/%m/%d} 是週末，今日不選股。")
-                return None, []
             d -= timedelta(days=1)
             continue
 
@@ -415,25 +425,46 @@ def fetch_recent_trading_days(end_date: datetime):
         try:
             twse = fetch_twse_day(d)
         except Exception as e:
+            if finding_latest:
+                log(f"⚠️ TWSE {d:%Y/%m/%d} 抓取失敗，改找前一個交易日：{e}")
+                time.sleep(REQUEST_SLEEP)
+                d -= timedelta(days=1)
+                continue
             failed.append(f"TWSE {date_str}：{e}")
             twse = None
 
         if twse is not None and twse.empty:
-            if is_end_day and REQUIRE_TODAY and not TARGET_DATE:
-                log(f"⚠️ TWSE {d:%Y/%m/%d} 沒有行情（休市或尚未公布），今日不推播。")
-                return None, []
-            log(f"⏭️ {d:%Y/%m/%d} 休市")
+            log(f"⏭️ {d:%Y/%m/%d} 上市無行情（休市或尚未公布）")
             time.sleep(REQUEST_SLEEP)
             d -= timedelta(days=1)
             continue
 
         try:
             tpex = fetch_tpex_day(d)
-            if tpex.empty:
-                failed.append(f"TPEx {date_str}：交易日卻沒有資料")
+            tpex_err = "交易日卻沒有資料" if tpex.empty else ""
         except Exception as e:
-            failed.append(f"TPEx {date_str}：{e}")
             tpex = None
+            tpex_err = str(e)
+
+        if tpex_err and finding_latest:
+            log(f"⚠️ TPEx {d:%Y/%m/%d} 上櫃行情尚未公布，改用前一個交易日當結算日")
+            time.sleep(REQUEST_SLEEP)
+            d -= timedelta(days=1)
+            continue
+        if tpex_err:
+            failed.append(f"TPEx {date_str}：{tpex_err}")
+
+        # 手動選「往前 N 個交易日」：完整交易日先跳過 N 個，再開始當結算日累積。
+        if finding_latest and days_back_left > 0:
+            log(f"⏭️ {d:%Y/%m/%d} 有完整行情，依 DAYS_BACK 再往前（剩 {days_back_left} 天）")
+            days_back_left -= 1
+            time.sleep(REQUEST_SLEEP)
+            d -= timedelta(days=1)
+            continue
+
+        if SKIP_IF_NOT_TODAY and finding_latest and date_str != end_date.strftime("%Y%m%d"):
+            log(f"⚠️ 最新完整行情是 {d:%Y/%m/%d}，不是 {end_date:%Y/%m/%d}，依設定不推播。")
+            return None, []
 
         if twse is not None:
             frames.append(twse)
@@ -532,17 +563,28 @@ def _post_discord(content: str) -> bool:
     return False
 
 
-def send_hits_to_discord(hits: pd.DataFrame, last_day: str):
+def _fmt_day(yyyymmdd: str) -> str:
+    return f"{yyyymmdd[:4]}/{yyyymmdd[4:6]}/{yyyymmdd[6:]}"
+
+
+def send_hits_to_discord(hits: pd.DataFrame, last_day: str, requested_day: str):
     if not DISCORD_WEBHOOK_URL:
         log("⚠️ 找不到 DISCORD_WEBHOOK_URL_TEST / DISCORD_WEBHOOK_URL，略過 Discord 推播。")
         return
 
-    day_label = f"{last_day[:4]}/{last_day[4:6]}/{last_day[6:]}"
-    header = f"📊 **XQ 下引線選股｜{day_label}｜共 {len(hits)} 檔**"
+    header = f"📊 **XQ 下引線選股｜資料日期：{_fmt_day(last_day)}｜共 {len(hits)} 檔**"
+    # 改用前一個交易日時一定要講清楚，不然看的人會以為是今天的盤。
+    if DAYS_BACK > 0:
+        header += f"\n🔁 手動回補：最新交易日往前 {DAYS_BACK} 個交易日的選股結果。"
+    elif last_day != requested_day:
+        header += (
+            f"\n⚠️ {_fmt_day(requested_day)} 沒有完整行情（休市或交易所尚未公布），"
+            f"以下為最近交易日 **{_fmt_day(last_day)}** 收盤的選股結果。"
+        )
 
     if hits.empty:
         if PUSH_WHEN_EMPTY:
-            _post_discord(f"{header}\n今日無符合條件個股。")
+            _post_discord(f"{header}\n本日無符合條件個股。")
         return
 
     # Discord 只列代號、名稱、當日漲跌幅；其餘欄位（下引、振幅、量比）留在 CSV。
@@ -593,19 +635,22 @@ def push_lower_shadow_to_dc():
     else:
         end_date = datetime.now(TW_TZ).replace(tzinfo=None)
 
+    requested_day = end_date.strftime("%Y%m%d")
     df, trading_days = fetch_recent_trading_days(end_date)
     if df is None:
         log("結束：今日無行情，不選股。")
         return
 
     last_day = trading_days[-1]
+    if last_day != requested_day:
+        log(f"⚠️ {requested_day} 無完整行情，改用最近交易日 {last_day} 結算")
     hits = build_lower_shadow_hits(df, trading_days)
     log(f"📊 {last_day} 符合 {len(hits)} 檔")
 
     csv_path = save_hits_csv(hits, last_day)
     log(f"✅ CSV 已輸出：{csv_path}")
 
-    send_hits_to_discord(hits, last_day)
+    send_hits_to_discord(hits, last_day, requested_day)
 
     log("=" * 80)
     log("完成：XQ 下引線選股")
