@@ -1,0 +1,43 @@
+name: XQ 下引線選股
+
+on:
+  schedule:
+    # 每天台灣 19:00（UTC 11:00）。週末 / 國定假日程式會自己判斷今日無行情、不推播。
+    # GitHub 排程尖峰時段常延遲 10～30 分鐘，實際推播時間會落在 19:00～19:30。
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "指定結算日 YYYYMMDD（留空 = 今天）"
+        required: false
+        default: ""
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 執行選股
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+        run: python lower_shadow_screener.py
+
+      - name: 上傳 CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lower-shadow-${{ github.run_id }}
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 30
