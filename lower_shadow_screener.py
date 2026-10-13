@@ -61,14 +61,10 @@ REQUEST_SLEEP = max(0.5, float(os.getenv("REQUEST_SLEEP", "2.5")))
 REQUEST_RETRIES = max(1, int(os.getenv("REQUEST_RETRIES", "4")))
 REQUEST_RETRY_SLEEP = max(1.0, float(os.getenv("REQUEST_RETRY_SLEEP", "6")))
 
-# 指定結算日（YYYYMMDD）。留空 = 今天（台北時間）。補跑歷史日期時用。
+# 指定結算日。留空 = 今天（台北時間）。GitHub 手動執行的日期框直接傳進來，
+# 格式隨便打：10/12、1012、2026-10-12、2026/10/12、20261012、115/10/12 都認得（見 parse_target_date）。
+# 打到假日會自動改用前一個交易日，Discord 會註明。
 TARGET_DATE = os.getenv("TARGET_DATE", "").strip()
-
-# 從「最新完整交易日」再往前 N 個交易日結算。給 GitHub 手動執行的下拉選單用，
-# 不用自己算日期、也不用管中間有沒有假日。0 = 最新交易日。
-# 選單值長得像「1｜前 1 個交易日」，只取開頭數字。
-_days_back_raw = re.match(r"\s*(\d+)", os.getenv("DAYS_BACK", "0") or "0")
-DAYS_BACK = int(_days_back_raw.group(1)) if _days_back_raw else 0
 
 # 預設：今天（或指定日）沒有完整行情時，自動改用最近一個上市櫃都有資料的交易日，
 # Discord 標題會寫明實際資料日期。設 SKIP_IF_NOT_TODAY=1 則改成「不是今天就不推播」，
@@ -208,6 +204,55 @@ def _is_target_code(code: str) -> bool:
     if _STOCK_CODE_RE.match(code):
         return True
     return INCLUDE_ETF and bool(_ETF_CODE_RE.match(code))
+
+
+def parse_target_date(raw: str, today: datetime) -> datetime:
+    """把手動輸入的日期轉成 datetime，格式盡量寬鬆。
+
+    GitHub 手動執行畫面只有文字框，沒有日曆，所以讓使用者想怎麼打就怎麼打：
+    - 10/12、10-12、10.12、1012、912      → 今年（若比今天晚就當去年）
+    - 2026/10/12、2026-10-12、20261012
+    - 115/10/12、1151012                    → 民國年
+    全形數字、全形斜線也吃（手機輸入法常打出全形）。
+    比今天晚的日期一律改成今天。
+    """
+    import unicodedata
+
+    s = unicodedata.normalize("NFKC", str(raw)).strip()
+    parts = re.findall(r"\d+", s)
+    y = m = d = None
+
+    if len(parts) == 1:
+        p = parts[0]
+        if len(p) == 8:
+            y, m, d = int(p[:4]), int(p[4:6]), int(p[6:])
+        elif len(p) == 7:
+            y, m, d = int(p[:3]) + 1911, int(p[3:5]), int(p[5:])
+        elif len(p) in (3, 4):
+            m, d = int(p[:-2]), int(p[-2:])
+    elif len(parts) == 2:
+        m, d = int(parts[0]), int(parts[1])
+    elif len(parts) == 3:
+        y, m, d = (int(x) for x in parts)
+        if y < 1000:
+            y += 1911
+
+    try:
+        if y is None:
+            result = datetime(today.year, m, d)
+            if result > today:
+                result = datetime(today.year - 1, m, d)
+        else:
+            result = datetime(y, m, d)
+    except Exception:
+        raise ValueError(
+            f"看不懂日期「{raw}」。請打像 10/12、1012、2026-10-12 這種格式，或留空用最新交易日。"
+        )
+
+    if result > today:
+        log(f"⚠️ 輸入的 {result:%Y/%m/%d} 還沒到，改用今天 {today:%Y/%m/%d}")
+        result = today
+    return result
 
 
 def _tpex_get_ca_bundle():
@@ -409,9 +454,8 @@ def fetch_recent_trading_days(end_date: datetime):
     trading_days = []
     failed = []
     d = end_date
-    days_back_left = DAYS_BACK
 
-    for _ in range(MAX_CALENDAR_SCAN_DAYS + DAYS_BACK * 2):
+    for _ in range(MAX_CALENDAR_SCAN_DAYS):
         if len(trading_days) >= NEED_TRADING_DAYS:
             break
         # 還沒找到結算日之前，缺資料一律當「尚未公布 / 休市」往前找，不算失敗。
@@ -453,14 +497,6 @@ def fetch_recent_trading_days(end_date: datetime):
             continue
         if tpex_err:
             failed.append(f"TPEx {date_str}：{tpex_err}")
-
-        # 手動選「往前 N 個交易日」：完整交易日先跳過 N 個，再開始當結算日累積。
-        if finding_latest and days_back_left > 0:
-            log(f"⏭️ {d:%Y/%m/%d} 有完整行情，依 DAYS_BACK 再往前（剩 {days_back_left} 天）")
-            days_back_left -= 1
-            time.sleep(REQUEST_SLEEP)
-            d -= timedelta(days=1)
-            continue
 
         if SKIP_IF_NOT_TODAY and finding_latest and date_str != end_date.strftime("%Y%m%d"):
             log(f"⚠️ 最新完整行情是 {d:%Y/%m/%d}，不是 {end_date:%Y/%m/%d}，依設定不推播。")
@@ -574,9 +610,7 @@ def send_hits_to_discord(hits: pd.DataFrame, last_day: str, requested_day: str):
 
     header = f"📊 **XQ 下引線選股｜資料日期：{_fmt_day(last_day)}｜共 {len(hits)} 檔**"
     # 改用前一個交易日時一定要講清楚，不然看的人會以為是今天的盤。
-    if DAYS_BACK > 0:
-        header += f"\n🔁 手動回補：最新交易日往前 {DAYS_BACK} 個交易日的選股結果。"
-    elif last_day != requested_day:
+    if last_day != requested_day:
         header += (
             f"\n⚠️ {_fmt_day(requested_day)} 沒有完整行情（休市或交易所尚未公布），"
             f"以下為最近交易日 **{_fmt_day(last_day)}** 收盤的選股結果。"
@@ -629,11 +663,12 @@ def push_lower_shadow_to_dc():
     )
     log("=" * 80)
 
+    today = datetime.now(TW_TZ).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     if TARGET_DATE:
-        end_date = datetime.strptime(TARGET_DATE, "%Y%m%d")
-        log(f"指定結算日：{TARGET_DATE}")
+        end_date = parse_target_date(TARGET_DATE, today)
+        log(f"指定結算日：輸入「{TARGET_DATE}」→ {end_date:%Y/%m/%d}")
     else:
-        end_date = datetime.now(TW_TZ).replace(tzinfo=None)
+        end_date = today
 
     requested_day = end_date.strftime("%Y%m%d")
     df, trading_days = fetch_recent_trading_days(end_date)

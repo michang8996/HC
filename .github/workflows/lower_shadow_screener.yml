@@ -8,25 +8,8 @@ on:
     - cron: "0 11 * * *"
   workflow_dispatch:
     inputs:
-      days_back:
-        description: "要看哪一天的選股（下拉選，假日自動跳過）"
-        type: choice
-        required: true
-        default: "0｜最新交易日"
-        options:
-          - "0｜最新交易日"
-          - "1｜前 1 個交易日"
-          - "2｜前 2 個交易日"
-          - "3｜前 3 個交易日"
-          - "4｜前 4 個交易日"
-          - "5｜前 5 個交易日"
-          - "6｜前 6 個交易日"
-          - "7｜前 7 個交易日"
-          - "8｜前 8 個交易日"
-          - "9｜前 9 個交易日"
-          - "10｜前 10 個交易日"
       target_date:
-        description: "進階：指定日期 YYYYMMDD（一般留空，用上面的選單就好）"
+        description: "日期（留空 = 最新交易日）。可打 10/12、1012、2026-10-12；打到假日會自動用前一個交易日"
         required: false
         default: ""
 
@@ -48,7 +31,6 @@ jobs:
       - name: 執行選股
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DAYS_BACK: ${{ github.event.inputs.days_back }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: python lower_shadow_screener.py
 
